@@ -6,18 +6,24 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
 
+
 # 检查是否是主进程
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
+
 
 # 日志
 def Logger(content):
     if is_main_process():
         print(content)
 
+
 # 动态学习率计算
 def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+    return (
+        lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
+    )  # ！修正：原公式 step=0 时 lr=1.1*lr 超出设定值，现修正为 step=0→lr, step=end→0.1*lr
+
 
 # 初始化分布式
 def init_distributed_mode():
@@ -29,6 +35,7 @@ def init_distributed_mode():
     torch.cuda.set_device(local_rank)
     return local_rank
 
+
 # 设置种子
 def setup_seed(seed: int):
     random.seed(seed)
@@ -38,6 +45,7 @@ def setup_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 # 设置检查点
 def lm_checkpoint(
@@ -114,6 +122,7 @@ def lm_checkpoint(
 
             return ckp_data
         return None
+
 
 # 初始化模型
 def init_model(

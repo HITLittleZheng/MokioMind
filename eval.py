@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.MokioModel import MokioMindConfig, MokioMindForCausalLM
+from model.model_lora import apply_lora, load_lora  # ！修正：原缺少LoRA加载支持
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
@@ -17,23 +18,39 @@ def init_model(args):
             MokioMindConfig(
                 hidden_size=args.hidden_size,
                 num_hidden_layers=args.num_hidden_layers,
+                use_moe=bool(
+                    args.use_moe
+                ),  # ！修正：原缺少use_moe参数，MoE模型无法正确加载
                 inference_rope_scaling=args.inference_rope_scaling,
             )
         )
         moe_suffix = "_moe" if hasattr(args, "use_moe") and args.use_moe else ""
         ckp = f"./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth"
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=False)
+        model.load_state_dict(
+            torch.load(ckp, map_location=args.device), strict=True
+        )  # ！修正：原strict=False会静默忽略丢失/多余的权重键
+
+        # ！修正：原缺少LoRA加载逻辑
+        if args.lora_weight != "None":
+            apply_lora(model)
+            load_lora(
+                model,
+                f"./{args.save_dir}/lora/{args.lora_weight}_{args.hidden_size}.pth",
+            )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.load_from, trust_remote_code=True
         )
     print(
-        f"MiniMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)"
+        f"MokioMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)"  # ！修正：原残留MiniMind命名
     )
     return model.eval().to(args.device), tokenizer
 
+
 def main():
-    parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
+    parser = argparse.ArgumentParser(
+        description="MokioMind模型推理与对话"
+    )  # ！修正：原残留MiniMind命名
     parser.add_argument(
         "--load_from",
         default="model",

@@ -1,5 +1,5 @@
 """
-MiniMind LoRA (Low-Rank Adaptation) 微调脚本
+MokioMind LoRA (Low-Rank Adaptation) 微调脚本  # ！修正：原MiniMind改为MokioMind
 
 📚 LoRA 核心知识点：
 - 什么是LoRA：一种参数高效微调方法，只训练少量新增参数
@@ -81,12 +81,13 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
     # 📚 enumerate的start参数
     # start=start_step + 1: 从指定步数开始计数，用于断点续训时保持step编号连续
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+    for step, (input_ids, labels) in enumerate(
+        loader, start=start_step + 1
+    ):  # ！修正：原(X, Y, loss_mask)解包3个值，但SFTDataset只返回2个值
         # 📚 张量设备迁移
         # .to(device): 将CPU上的张量移动到GPU，必须保证数据和模型在同一设备
-        X = X.to(args.device)  # 输入序列
-        Y = Y.to(args.device)  # 目标序列
-        loss_mask = loss_mask.to(args.device)  # 损失掩码
+        input_ids = input_ids.to(args.device)  # 输入序列
+        labels = labels.to(args.device)  # 目标序列
 
         # 📚 动态学习率调整
         # 使用余弦退火策略，学习率随训练进度平滑下降
@@ -103,27 +104,14 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         # 可以加速训练并节省显存，同时保持数值稳定性
         with autocast_ctx:
             # 模型前向传播
-            res = model(X)
+            res = model(
+                input_ids, labels=labels
+            )  # ！修正：直接传入labels，由模型内部计算loss
 
-            # 📚 损失计算详解
-            # 1. res.logits: [batch_size, seq_len, vocab_size]
-            # 2. view(-1, size): 将张量展平，-1表示自动计算该维度
-            # 3. Y.view(-1): 将目标序列展平为一维
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),  # [batch*seq, vocab]
-                Y.view(-1),  # [batch*seq]
-            ).view(Y.size())  # 恢复为 [batch_size, seq_len]
-
-            # 📚 掩码损失计算
-            # 只对有效位置（非padding）计算损失
-            # .sum(): 求和所有有效位置的损失
-            # / loss_mask.sum(): 除以有效位置数量，得到平均损失
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-
-            # 📚 MoE辅助损失
-            # 如果使用MoE（混合专家）架构，需要加上负载均衡损失
-            # 确保不同专家被均匀使用
-            loss += res.aux_loss
+            # SFT总损失 = 主任务loss + 辅助loss（MoE路由辅助）
+            loss = (
+                res.loss + res.aux_loss
+            )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
 
             # 📚 梯度累积
             # 将损失除以累积步数，实现梯度累积效果

@@ -33,14 +33,14 @@ warnings.filterwarnings("ignore")
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+    for step, (input_ids, labels) in enumerate(
+        loader, start=start_step + 1
+    ):  # ！修正：原(X, Y, loss_mask)解包3个值，但PretrainDataset只返回2个值
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -49,16 +49,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             # 前向传播
-            res = model(X)
+            res = model(
+                input_ids, labels=labels
+            )  # ！修正：直接传入labels，由模型内部计算loss
 
-            loss = loss_fct(
-                res.logits.view(-1, res.logits.size(-1)),  # [batch*seq, vocab_size]
-                Y.view(-1),  # [batch*seq]
-            ).view(Y.size())  # 恢复为 [batch_size, seq_len]
-
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-
-            loss += res.aux_loss
+            loss = (
+                res.loss + res.aux_loss
+            )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
 
             loss = loss / args.accumulation_steps
 
@@ -126,7 +123,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="checkpoints",
+                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
             )
 
             model.train()  # 恢复训练模式
@@ -136,7 +133,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MokioMind Pretraining")
 
     # ========== 基础训练参数 ==========
-    parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
+    parser.add_argument(
+        "--save_dir", type=str, default="../out", help="模型保存目录"
+    )  # ！修正：原"out"缺少../前缀
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
@@ -182,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="dataset/pretrain_hq.jsonl",
+        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
         help="预训练数据路径",
     )
     parser.add_argument(
@@ -243,7 +242,9 @@ if __name__ == "__main__":
     # 📚 断点续训知识点
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="checkpoints")
+        lm_checkpoint(
+            lm_config, weight=args.save_weight, save_dir="../checkpoints"
+        )  # ！修正：原"checkpoints"缺少../前缀
         if args.from_resume == 1
         else None
     )

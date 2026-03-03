@@ -390,7 +390,7 @@ class MoEGate(nn.Module):
         return topk_idx, topk_weight, aux_loss
 
 
-class MoEFeedForaward(nn.Module):
+class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
@@ -500,7 +500,9 @@ class MokioMindBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.mlp = (
-            FeedForward(config) if not config.use_moe else MoEFeedForaward(config)
+            FeedForward(config)
+            if not config.use_moe
+            else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
         )
 
     def forward(
@@ -602,7 +604,9 @@ class MokioMindModel(nn.Module):
             [
                 layer.mlp.aux_loss
                 for layer in self.layers
-                if isinstance(layer.mlp, MoEFeedForaward)
+                if isinstance(
+                    layer.mlp, MoEFeedForward
+                )  # ！修正：原MoEFeedForaward拼写错误
             ],
             hidden_states.new_zeros(1).squeeze(),
         )

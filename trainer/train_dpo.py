@@ -38,15 +38,18 @@ def logits_to_log_probs(logits, labels):
     # 也就是从拿到token在其对应位置的概率
     log_probs_per_token = torch.gather(
         log_probs, dim=2, index=labels.unsqueeze(2)
-    ).unsqueeze(-1)
+    ).squeeze(
+        -1
+    )  # ！修正：原.unsqueeze(-1)导致维度错误[B,S,1,1]，应用.squeeze(-1)降维到[B,S]
     return log_probs_per_token
 
 
 # DPO的loss计算
 # 公式：L = -log(σ(β * (π(y_w) - π(y_l) - (π_ref(y_w) - π_ref(y_l)))))
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
-    seq_lengths = mask.sum(dim=1, keepdim=True)
-    clamp_min(1e-8)
+    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(
+        1e-8
+    )  # ！修正：原clamp_min断裂为独立一行，导致NameError
     # 计算ref和policy的序列log概率均值
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
@@ -103,7 +106,10 @@ def train_epoch(
             policy_log_probs = logits_to_log_probs(logits, y)
 
             # 📚 DPO损失计算
-            loss = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            loss = (
+                dpo_loss_val + outputs.aux_loss
+            )  # ！修正：原缺少aux_loss，MoE辅助损失被丢弃
             loss = loss / args.accumulation_steps
 
         # 📚 反向传播

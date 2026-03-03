@@ -105,7 +105,9 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
             ]
 
             tmp_chat = messages + [{"role": "assistant", "content": response}]
-            score = reward_model.get_reward(tmp_chat, reward_tokenizer)
+            score = reward_model.get_score(
+                reward_tokenizer, tmp_chat
+            )  # ！修正：原get_reward(tmp_chat, reward_tokenizer)方法名和参数顺序错误
 
             scale = 3.0
             score = max(min(score, scale), -scale)
