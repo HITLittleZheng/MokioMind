@@ -30,6 +30,7 @@ class MokioMindConfig(PretrainedConfig):
         aux_loss_alpha: float = 0.1,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
+        sliding_window: int = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -57,6 +58,7 @@ class MokioMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.aux_loss_alpha = aux_loss_alpha
         self.scoring_func = scoring_func
+        self.sliding_window = sliding_window
 
         self.rope_scaling = (
             {
@@ -93,7 +95,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        return self.weight * self._norm(x.float()).typed_as(x)
+        return self.weight * self._norm(x.float()).type_as(x)
 
 
 def precompute_freqs(
@@ -102,48 +104,74 @@ def precompute_freqs(
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
 ):
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # 1. 初始化标准 RoPE 频率。
+    # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
+    # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
+    freqs, attn_factor = (
+        1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),
+        1.0,
+    )
 
     if rope_scaling is not None:
-        original_max, factor, beta_fast, beta_slow = (
+        # 2. 从配置字典中提取 YaRN 的超参数
+        # orig_max: 模型预训练时的原始最大长度（例如 Llama-2 是 2048 或 4096）
+        # factor: 要扩展的倍数 s (比如从 2k 扩展到 32k，factor 就是 16)
+        # beta_fast (对应论文中的 α): 高频边界，波长比例大于此值的维度不缩放
+        # beta_slow (对应论文中的 β): 低频边界，波长比例小于此值的维度全量缩放
+        # attn_factor: 注意力温度补偿，由于距离拉长导致注意力分布发散（变平缓），需要乘上一个系数让注意力重新“聚焦”
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048),
-            rope_scaling.get("factor", 4),
-            rope_scaling.get("beta_fast", 4.0),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0),
             rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0),
         )
 
-        if end / original_max > 1.0:
-            corr_dim = next(
-                (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > original_max),
-                dim // 2,
+        # 只有当要推断的长度大于原始训练长度时，才应用缩放
+        if end / orig_max > 1.0:
+            # 3. 使用前文推导的公式，定义波长比例 b 到维度索引 i 的映射函数
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (
+                2 * math.log(rope_base)
             )
 
-            power = torch.arange(0, dim // 2, device=freqs.device).float() / max(
-                dim // 2 - 1, 1
+            # 4. 计算高频区和低频区的维度切分点
+            # low: 不需要缩放的高频部分的最高索引
+            # high: 需要完全缩放的低频部分的最低索引
+            low, high = (
+                max(math.floor(inv_dim(beta_fast)), 0),
+                min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1),
             )
 
-            beta = beta_slow + (beta_fast - beta_slow) * power
-
-            scale = torch.where(
-                torch.arange(dim // 2, device=freqs.device) < corr_dim,
-                (beta * factor - beta + 1) / (beta * factor),
-                1.0 / factor,
+            # 5. 计算混合因子 γ (Ramp)
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low)
+                / max(high - low, 0.001),
+                0,
+                1,
             )
 
-            freqs = freqs * scale
+            # 6. 频率融合公式：f'(i) = f(i) * ((1-γ) + γ/s)
+            # 当 ramp=0 时（高频）：系数为 1，保持原频率不变。
+            # 当 ramp=1 时（低频）：系数为 1/factor，即对频率进行线性插值缩放。
+            # ramp在0-1之间时：平滑过渡。
+            freqs = freqs * (1 - ramp + ramp / factor)
 
+    # 7. 根据目标长度 end，生成位置索引向量 t
     t = torch.arange(end, device=freqs.device)
+
+    # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
     freqs = torch.outer(t, freqs).float()
 
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
 
     return freqs_cos, freqs_sin
 
 
-def apply_rotary_pos_emb(
-    q, k, cos, sin, position_ids=None, unsqueeze_dim=1
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
@@ -203,6 +231,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.sliding_window = args.sliding_window
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
             and args.flash_attention
@@ -231,11 +260,19 @@ class Attention(nn.Module):
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
 
+        # 引入 SWA 截断，控制 KV Cache 的最大保留长度
+        if self.sliding_window is not None:
+            if xk.shape[1] > self.sliding_window:
+                xk = xk[:, -self.sliding_window :, ...]
+                xv = xv[:, -self.sliding_window :, ...]
+
         past_kv = (xk, xv) if use_cache else None
 
         xq = xq.transpose(1, 2)
         xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
         xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+
+        kv_seq_len = xk.shape[-2]
 
         if (
             self.flash
@@ -249,21 +286,60 @@ class Attention(nn.Module):
                 .expand(bsz, self.n_local_heads, seq_len, -1)
                 .bool()
             )
+            # 兼容带有 sliding_window 参数的 SWA 或自定义 local causal mask
+            # 如果配置了 sliding_window 并且 flash attention 无法直接处理，可使用 boolean mask 替代
+            if self.sliding_window is not None:
+                is_causal = False
+                # 创建一个局部窗口注意力的 Band Mask
+                window_mask = torch.ones(
+                    (seq_len, kv_seq_len), dtype=torch.bool, device=xq.device
+                )
+                window_mask = torch.tril(window_mask)
+                if seq_len == kv_seq_len:
+                    window_mask = torch.triu(
+                        window_mask, diagonal=-self.sliding_window + 1
+                    )
+                else:
+                    # 推理或分块的情况下，计算偏移逻辑
+                    offset = kv_seq_len - seq_len
+                    # 这里暂存简化的推断处理
+                    window_mask = torch.triu(
+                        window_mask, diagonal=-self.sliding_window + 1 + offset
+                    )
+
+                window_mask = window_mask.unsqueeze(0).unsqueeze(0)
+                if attn_mask is not None:
+                    attn_mask = attn_mask & window_mask
+                else:
+                    attn_mask = window_mask
+            else:
+                is_causal = True
+
             output = F.scaled_dot_product_attention(
                 xq,
                 xk,
                 xv,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,  # 自回归（因果）注意力
+                is_causal=is_causal,  # SWA 时为 False，使用 custom mask 替代
             )
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
             causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                diagonal=-1,
+                torch.full((seq_len, kv_seq_len), float("-inf"), device=scores.device),
+                diagonal=1 + (kv_seq_len - seq_len),
             )
+
+            # 引入 SWA 限制，不在窗口内的全 mask 掉 (负无穷)
+            if self.sliding_window is not None:
+                swa_mask = torch.tril(
+                    torch.full(
+                        (seq_len, kv_seq_len), float("-inf"), device=scores.device
+                    ),
+                    diagonal=-self.sliding_window + (kv_seq_len - seq_len),
+                )
+                causal_mask = torch.min(causal_mask, swa_mask)
 
             scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
 
@@ -371,8 +447,8 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
-            aux_loss = 0
-        return topk_weight, topk_idx, aux_loss
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
 
 
 class MoEFeedForaward(nn.Module):
@@ -395,8 +471,8 @@ class MoEFeedForaward(nn.Module):
         orig_shape = x.shape
         bsz, seq_len, h = orig_shape
 
-        # 使用门控机制旋转专家
-        topk_weight, topk_idx, aux_loss = self.gate(x)
+        # 使用门控机制选择专家
+        topk_idx, topk_weight, aux_loss = self.gate(x)
         # 展开x以便处理
         x = x.view(-1, x.shape[-1])
 
@@ -406,16 +482,22 @@ class MoEFeedForaward(nn.Module):
             # 每个token安排num_experts_per_tok个专家处理
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             # y是空张量，和x形状相同
-            y = torch.empty_like(x, dtype=torch.float32)
+            y = torch.empty_like(x, dtype=x.dtype)
             # 遍历所有专家
             for i, expert in enumerate(self.experts):
                 # 找到所有指向专家i的token
                 # 然后将这些token输入专家i进行处理
                 # 最后将结果放回y对应位置
-                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
             # 加权求和
             # 最后的y意义是每个token经过专家处理后的加权结果
-            y = y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1).sum(dim=1)
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         # 如果是推理阶段
         else:
@@ -578,9 +660,12 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         aux_loss = sum(
-            layer.mlp.aux_loss
-            for layer in self.layers
-            if isinstance(layer.mlp, MoEFeedForaward)
+            [
+                layer.mlp.aux_loss
+                for layer in self.layers
+                if isinstance(layer.mlp, MoEFeedForaward)
+            ],
+            hidden_states.new_zeros(1).squeeze(),
         )
 
         return hidden_states, presents, aux_loss
@@ -599,12 +684,13 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **args,
     ):
-        h, past_kvs, aux_loss = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -617,10 +703,23 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(h[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        return CausalLMOutputWithPast(
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        output = CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
-            past_key_values=past_kvs,
-            hidden_states=h,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
         )
+        output.aux_loss = aux_loss
+        return output
