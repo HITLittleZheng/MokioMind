@@ -27,10 +27,9 @@ class MokioMindConfig(PretrainedConfig):
         n_routed_experts: int = 4,
         n_shared_experts: int = 1,
         scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.1,
+        aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
-        sliding_window: int = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -58,14 +57,14 @@ class MokioMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.aux_loss_alpha = aux_loss_alpha
         self.scoring_func = scoring_func
-        self.sliding_window = sliding_window
 
         self.rope_scaling = (
             {
-                "beta_fast": 4,
+                "beta_fast": 32,
                 "beta_slow": 1,
-                "factor": 4,
+                "factor": 16,
                 "original_max_position_embeddings": 2048,
+                "attention_factor": 1.0,
                 "type": "yarn",
             }
             if self.inference_rope_scaling
@@ -87,7 +86,6 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
@@ -231,7 +229,6 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-        self.sliding_window = args.sliding_window
         self.flash = (
             hasattr(torch.nn.functional, "scaled_dot_product_attention")
             and args.flash_attention
@@ -246,102 +243,45 @@ class Attention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len, _ = x.shape
-
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
+        # kv_cache实现
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
-
-        # 引入 SWA 截断，控制 KV Cache 的最大保留长度
-        if self.sliding_window is not None:
-            if xk.shape[1] > self.sliding_window:
-                xk = xk[:, -self.sliding_window :, ...]
-                xv = xv[:, -self.sliding_window :, ...]
-
         past_kv = (xk, xv) if use_cache else None
 
-        xq = xq.transpose(1, 2)
-        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
-        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
-
-        kv_seq_len = xk.shape[-2]
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
 
         if (
             self.flash
-            and seq_len > 1
+            and (seq_len > 1)
+            and (past_key_value is None)
             and (attention_mask is None or torch.all(attention_mask == 1))
         ):
-            attn_mask = (
-                None
-                if attention_mask is None
-                else attention_mask.view(bsz, 1, 1, -1)
-                .expand(bsz, self.n_local_heads, seq_len, -1)
-                .bool()
-            )
-            # 兼容带有 sliding_window 参数的 SWA 或自定义 local causal mask
-            # 如果配置了 sliding_window 并且 flash attention 无法直接处理，可使用 boolean mask 替代
-            if self.sliding_window is not None:
-                is_causal = False
-                # 创建一个局部窗口注意力的 Band Mask
-                window_mask = torch.ones(
-                    (seq_len, kv_seq_len), dtype=torch.bool, device=xq.device
-                )
-                window_mask = torch.tril(window_mask)
-                if seq_len == kv_seq_len:
-                    window_mask = torch.triu(
-                        window_mask, diagonal=-self.sliding_window + 1
-                    )
-                else:
-                    # 推理或分块的情况下，计算偏移逻辑
-                    offset = kv_seq_len - seq_len
-                    # 这里暂存简化的推断处理
-                    window_mask = torch.triu(
-                        window_mask, diagonal=-self.sliding_window + 1 + offset
-                    )
-
-                window_mask = window_mask.unsqueeze(0).unsqueeze(0)
-                if attn_mask is not None:
-                    attn_mask = attn_mask & window_mask
-                else:
-                    attn_mask = window_mask
-            else:
-                is_causal = True
-
             output = F.scaled_dot_product_attention(
                 xq,
                 xk,
                 xv,
-                attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=is_causal,  # SWA 时为 False，使用 custom mask 替代
+                is_causal=True,
             )
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-            causal_mask = torch.triu(
-                torch.full((seq_len, kv_seq_len), float("-inf"), device=scores.device),
-                diagonal=1 + (kv_seq_len - seq_len),
+            scores[:, :, :, -seq_len:] += torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
             )
-
-            # 引入 SWA 限制，不在窗口内的全 mask 掉 (负无穷)
-            if self.sliding_window is not None:
-                swa_mask = torch.tril(
-                    torch.full(
-                        (seq_len, kv_seq_len), float("-inf"), device=scores.device
-                    ),
-                    diagonal=-self.sliding_window + (kv_seq_len - seq_len),
-                )
-                causal_mask = torch.min(causal_mask, swa_mask)
-
-            scores = scores + causal_mask.unsqueeze(0).unsqueeze(0)
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -433,8 +373,7 @@ class MoEGate(nn.Module):
                     1,
                     topk_idx_for_aux_loss,
                     torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
-                )
-                ce = ce.div(seq_len * aux_topk / self.n_routed_experts)
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
                     dim=1
                 ).mean() * self.alpha
