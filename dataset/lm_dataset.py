@@ -327,10 +327,10 @@ class DPODataset(Dataset):
 
         # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask_chosen = (
-            torch.tensor(chosen_input_ids, dtype=torch.long) != self.padding
+            torch.tensor(chosen_input_ids[:-1], dtype=torch.long) != self.padding
         ).long()
         attention_mask_rejected = (
-            torch.tensor(rejected_input_ids, dtype=torch.long) != self.padding
+            torch.tensor(rejected_input_ids[:-1], dtype=torch.long) != self.padding
         ).long()
 
         return {
@@ -441,18 +441,7 @@ class RLAIFDataset(Dataset):
         # 返回原始字符串，不做 tokenize，由 RL trainer 在线处理
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
-        # ！修正：返回 prompt 对应的 attention_mask token id 列表（由 RL trainer 决定是否使用）
-        prompt_input_ids = self.tokenizer(prompt).input_ids
-        attention_mask = (
-            (
-                torch.tensor(prompt_input_ids, dtype=torch.long)
-                != self.tokenizer.pad_token_id
-            )
-            .long()
-            .tolist()
-        )
-
-        return {"prompt": prompt, "answer": answer, "attention_mask": attention_mask}
+        return {"prompt": prompt, "answer": answer}
 
 
 if __name__ == "__main__":

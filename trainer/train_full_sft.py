@@ -85,7 +85,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward()
 
         # 📚 梯度累积达到阈值，执行参数更新
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             # 还原梯度的真实值（从缩放状态恢复）
             scaler.unscale_(optimizer)
 
@@ -101,7 +101,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             optimizer.zero_grad(set_to_none=True)
 
         # 📚 日志记录：定期输出训练指标
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             # 恢复真实的loss值（乘回accumulation_steps）
             current_loss = loss.item() * args.accumulation_steps
@@ -128,7 +128,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 )
 
         # 📚 模型检查点保存：定期保存训练状态
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()  # 切换到评估模式（禁用dropout等）
 
             # 构建保存路径（根据是否使用MoE添加后缀）

@@ -7,7 +7,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import argparse  # 命令行参数解析
 import time  # 时间统计
-import warnings  # 警告控制
 import torch  # PyTorch深度学习框架
 import torch.nn.functional as F  # 神经网络函数
 import torch.distributed as dist  # 分布式训练支持
@@ -128,7 +127,7 @@ def train_epoch(
         # 📚 反向传播
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -136,7 +135,7 @@ def train_epoch(
             optimizer.zero_grad(set_to_none=True)
 
         # 📚 训练日志
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_lr = optimizer.param_groups[-1]["lr"]
@@ -152,7 +151,7 @@ def train_epoch(
                 )
 
         # 📚 模型保存
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
@@ -365,7 +364,7 @@ if __name__ == "__main__":
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
+                train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
             loader = DataLoader(
                 train_ds,
@@ -379,7 +378,7 @@ if __name__ == "__main__":
             train_epoch(
                 epoch,
                 loader,
-                len(loader) + start_step + 1,
+                len(loader) + start_step,
                 ref_model,
                 lm_config,
                 start_step,

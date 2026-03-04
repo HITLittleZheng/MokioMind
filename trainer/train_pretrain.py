@@ -11,7 +11,7 @@ import warnings  # 警告控制
 import torch
 import torch.distributed as dist  # 分布式训练支持
 from contextlib import nullcontext  # 上下文管理器
-from torch import optim, nn  # 优化器和神经网络模块
+from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
@@ -64,7 +64,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
 
@@ -78,7 +78,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
             current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
@@ -95,7 +95,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()  # 切换到评估模式
 
             # 构建保存路径
@@ -339,7 +339,7 @@ if __name__ == "__main__":
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
             # 使用跳批采样器，跳过已训练的数据
             batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
+                train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
             loader = DataLoader(
                 train_ds,
@@ -350,7 +350,7 @@ if __name__ == "__main__":
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
         else:  # 默认从头开始
             loader = DataLoader(
                 train_ds,

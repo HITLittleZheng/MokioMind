@@ -33,7 +33,7 @@ import warnings  # 警告控制
 import torch  # PyTorch深度学习框架
 import torch.distributed as dist  # 分布式训练支持
 from contextlib import nullcontext  # 上下文管理器（无操作占位符）
-from torch import optim, nn  # 优化器和神经网络模块
+from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载
 
@@ -73,10 +73,6 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         start_step: 起始步数（用于断点续训）
         wandb: 实验跟踪工具
     """
-    # 📚 交叉熵损失函数
-    # reduction='none': 保持每个位置的损失值，不自动求平均
-    # 这样可以配合loss_mask进行精确的损失计算
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
     start_time = time.time()
 
     # 📚 enumerate的start参数
@@ -126,7 +122,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         # 📚 梯度累积和参数更新
         # 每accumulation_steps步才真正更新一次参数
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             # 📚 梯度反缩放
             # scaler.unscale_(optimizer): 将放大的梯度恢复到真实值
             # 必须在梯度裁剪之前调用
@@ -151,7 +147,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         # 📚 训练日志记录
         # 每log_interval步或最后一步打印一次日志
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             # 📚 .item()方法
             # 将单元素张量转换为Python标量
@@ -183,7 +179,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         # 📚 LoRA模型检查点保存
         # 每save_interval步或最后一步保存一次
         # is_main_process(): 只有主进程保存，避免多进程重复写入
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()  # 切换到评估模式
 
             # 📚 LoRA权重保存路径
@@ -485,7 +481,7 @@ if __name__ == "__main__":
             # SkipBatchSampler: 自定义采样器，跳过前N个batch
             # 用于断点续训时从指定step开始
             batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
+                train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
             loader = DataLoader(
                 train_ds,
@@ -499,7 +495,7 @@ if __name__ == "__main__":
             train_epoch(
                 epoch,
                 loader,
-                len(loader) + start_step + 1,
+                len(loader) + start_step,
                 lora_params,
                 start_step,
                 wandb,

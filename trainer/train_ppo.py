@@ -268,7 +268,7 @@ def ppo_train_epoch(
         loss.backward()
 
         # 更新参数
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
             actor_optimizer.step()
@@ -279,7 +279,7 @@ def ppo_train_epoch(
             critic_optimizer.zero_grad()
 
         # 📚 日志记录
-        if is_main_process():
+        if is_main_process() and (step % args.log_interval == 0 or step == iters):
             response_ids = gen_out[:, enc.input_ids.shape[1] :]
             is_eos = response_ids == tokenizer.eos_token_id
             eos_indices = torch.argmax(is_eos.int(), dim=1)
@@ -321,7 +321,7 @@ def ppo_train_epoch(
             )
 
         # 📚 更新old actor
-        if (step + 1) % args.update_old_actor_freq == 0:
+        if step % args.update_old_actor_freq == 0:
             state_dict = (
                 actor_model.module.state_dict()
                 if isinstance(actor_model, DistributedDataParallel)
@@ -333,7 +333,7 @@ def ppo_train_epoch(
             old_actor_model.to(args.device)
 
         # 📚 模型保存
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             actor_model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
@@ -526,6 +526,8 @@ if __name__ == "__main__":
     # 📚 Actor模型（策略模型）
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
     tokenizer.padding_side = "left"  # PPO需要左侧padding
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # 📚 Old Actor模型（用于重要性采样）
     old_actor_model, _ = init_model(lm_config, base_weight, device=args.device)
@@ -565,7 +567,7 @@ if __name__ == "__main__":
         train_ds, batch_size=args.batch_size, sampler=train_sampler
     )
     iters = len(loader_for_count)
-    total_optimizer_steps = (iters // args.accumulation_steps) * args.epochs
+    total_optimizer_steps = max(1, (iters // args.accumulation_steps) * args.epochs)
     actor_scheduler = CosineAnnealingLR(
         actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10
     )
@@ -600,7 +602,7 @@ if __name__ == "__main__":
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
             batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
+                train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
             loader = DataLoader(
                 train_ds,
@@ -614,7 +616,7 @@ if __name__ == "__main__":
             ppo_train_epoch(
                 epoch,
                 loader,
-                len(loader) + start_step + 1,
+                len(loader) + start_step,
                 old_actor_model,
                 ref_model,
                 actor_scheduler,
